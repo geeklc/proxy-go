@@ -1,0 +1,691 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"io"
+	"log"
+	"net"
+	"proxy-go/build"
+	"proxy-go/sql"
+	"strconv"
+	"strings"
+)
+
+/* ======================================================
+ * Protocol (Shadow RPC v1)
+ * ====================================================== */
+
+/* ---------- WHERE expr (only for OPEN) ---------- */
+
+type WhereExpr struct {
+	Type  string      `json:"type"`            // and / or / cmp / col / const
+	Op    string      `json:"op,omitempty"`    // = != < > <= >= LIKE
+	Name  string      `json:"name,omitempty"`  // column name
+	Value string      `json:"value,omitempty"` // literal
+	Args  []WhereExpr `json:"args,omitempty"`
+	Left  *WhereExpr  `json:"left,omitempty"`
+	Right *WhereExpr  `json:"right,omitempty"`
+}
+type Aggregate struct {
+	Type   string `json:"type"`   // COUNT / MIN / MAX
+	Column string `json:"column"` // "*" or column name
+}
+
+type OrderBy struct {
+	Col  string `json:"col"`
+	Desc bool   `json:"desc"`
+}
+
+/* ---------- Unified Request ---------- */
+
+type Request struct {
+	Op      string `json:"op"`
+	Table   string `json:"table"`
+	DBName  string `json:"dbname,omitempty"`
+	TraceID string `json:"trace_id,omitempty"`
+
+	ResultFormat string `json:"result_format,omitempty"`
+	/* OPEN */
+	Projection []string   `json:"projection,omitempty"`
+	Where      *WhereExpr `json:"where,omitempty"`
+	OrderBy    []OrderBy  `json:"order_by,omitempty"`
+	Limit      uint64     `json:"limit,omitempty"`
+	Offset     uint64     `json:"offset,omitempty"`
+	Aggregate  *Aggregate `json:"aggregate,omitempty"`
+	/* INSERT / DELETE */
+	Row map[string]interface{} `json:"row,omitempty"`
+
+	/* UPDATE */
+	Set      map[string]interface{} `json:"set,omitempty"`
+	WhereRow map[string]interface{} `json:"where_row,omitempty"`
+
+	KeyData map[string]interface{} `json:"key_data,omitempty"`
+
+	/* POINT_GET */
+	RowID string `json:"row_id,omitempty"`
+
+	/* RAW */
+	Sql string `json:"sql,omitempty"`
+}
+
+/* ======================================================
+ * Entry
+ * ====================================================== */
+
+func main() {
+	err := sql.InitFromDB()
+	if err != nil {
+		log.Println(err)
+	}
+
+	ln, err := net.Listen("tcp", "0.0.0.0:5555")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("[ShadowGoServer] listening on 127.0.0.1:5555")
+
+	for {
+		conn, _ := ln.Accept()
+		go handleConn(conn)
+	}
+}
+
+/* ======================================================
+ * Connection
+ * ====================================================== */
+
+func handleConn(conn net.Conn) {
+
+	defer conn.Close()
+
+	decoder := json.NewDecoder(conn)
+
+	for {
+		var req Request
+		if err := decoder.Decode(&req); err != nil {
+			if err == io.EOF {
+				// ✅ 客户端正常结束（短连接 or 长连接关闭）
+				log.Println("[INFO] client closed connection")
+				return
+			}
+			// 真正的协议 / JSON 错误
+			log.Println("[ERR] decode failed:", err)
+			return
+		}
+
+		log.Printf(
+			"[REQ] op=%s table=%s db=%s trace=%s",
+			req.Op,
+			req.Table,
+			req.DBName,
+			req.TraceID,
+		)
+		switch req.Op {
+		case "OPEN":
+			handleOpen(conn, req)
+		case "INSERT":
+			handleInsert(conn, req)
+		case "UPDATE":
+			handleUpdate(conn, req)
+		case "DELETE":
+			handleDelete(conn, req)
+		case "POINT_GET":
+			handlePointGet(conn, req)
+		case "RAW":
+			handleRaw(conn, req)
+		default:
+			sendError(conn, "unknown op")
+		}
+	}
+}
+
+func sendOK(conn net.Conn) {
+	var seq uint8 = 0
+	ok := []byte{0x00, 0x00, 0x00, 0x02, 0x00, 0x00}
+	_ = build.WritePacket(conn, &seq, ok)
+}
+
+func writeLenEncInt(buf *[]byte, n uint64) {
+	switch {
+	case n < 251:
+		*buf = append(*buf, byte(n))
+	case n < 1<<16:
+		*buf = append(*buf, 0xfc)
+		*buf = append(*buf, byte(n), byte(n>>8))
+	case n < 1<<24:
+		*buf = append(*buf, 0xfd)
+		*buf = append(*buf,
+			byte(n),
+			byte(n>>8),
+			byte(n>>16),
+		)
+	default:
+		*buf = append(*buf, 0xfe)
+		for i := 0; i < 8; i++ {
+			*buf = append(*buf, byte(n>>(8*i)))
+		}
+	}
+}
+
+func buildOKPayload(
+	affectedRows uint64,
+	insertId uint64,
+	status uint16,
+	warnings uint16,
+	info string,
+) []byte {
+
+	var payload []byte
+
+	// header
+	payload = append(payload, 0x00)
+
+	// affected_rows
+	writeLenEncInt(&payload, affectedRows)
+
+	// last_insert_id
+	writeLenEncInt(&payload, insertId)
+
+	// status_flags (2 bytes little endian)
+	payload = append(payload,
+		byte(status),
+		byte(status>>8),
+	)
+
+	// warnings (2 bytes little endian)
+	payload = append(payload,
+		byte(warnings),
+		byte(warnings>>8),
+	)
+
+	// info (optional)
+	if info != "" {
+		payload = append(payload, []byte(info)...)
+	}
+
+	return payload
+}
+
+func sendError(conn net.Conn, msg string) {
+	var seq uint8 = 0
+	payload := append([]byte{0xFF, 0x00, 0x00}, []byte(msg)...)
+	_ = build.WritePacket(conn, &seq, payload)
+}
+
+/* ======================================================
+ * Projection helpers (WRITE OPS)
+ * ====================================================== */
+
+// 把 projection 转成 set；nil 表示不限制
+func projectionSet(p []string) map[string]struct{} {
+	if len(p) == 0 {
+		return nil
+	}
+	m := make(map[string]struct{}, len(p))
+	for _, c := range p {
+		m[c] = struct{}{}
+	}
+	return m
+}
+
+// 只保留 projection 中允许的列
+func filterByProjection(
+	input map[string]interface{},
+	proj map[string]struct{},
+) map[string]interface{} {
+
+	if proj == nil {
+		return input
+	}
+
+	out := make(map[string]interface{})
+	for k, v := range input {
+		if _, ok := proj[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+/* ======================================================
+ * Handlers
+ * ====================================================== */
+func handleRaw(conn net.Conn, req Request) {
+	log.Println("[OPEN]")
+	log.Printf("  table      = %s", req.Table)
+	log.Printf("  DBName 	= %s", req.DBName)
+	log.Printf("  sql      	= %s", req.Sql)
+
+	log.Printf("RAW  SQL = %s", req.Sql)
+	query, err := sql.MyDB.Query(req.Sql)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	defer query.Close()
+	cols, _ := query.Columns()
+	colTypes, _ := query.ColumnTypes()
+
+	var seq uint8 = 0
+
+	// Column count
+	_ = build.WritePacket(conn, &seq,
+		mysql.PutLengthEncodedInt(uint64(len(cols))))
+
+	// Rows
+	values := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	i := 0
+	for query.Next() {
+		query.Scan(ptrs...)
+		row, fields, _ := build.MakeBinaryRow1(values, i, cols)
+		if i == 0 {
+			writeFields(fields, &seq, conn)
+		}
+		_ = build.WritePacket(conn, &seq, row)
+		i = i + 1
+	}
+	build.WriteEOF(conn, &seq)
+	//如果数据为空则返回字段名
+	if i == 0 {
+		build.WriteColumnNames(cols, conn, colTypes, &seq)
+	}
+}
+
+func handleOpen(conn net.Conn, req Request) {
+	log.Println("[OPEN]")
+	log.Printf("  table      = %s", req.Table)
+	log.Printf("  projection = %v", req.Projection)
+	log.Printf("  limit      = %d", req.Limit)
+	log.Printf("  offset     = %d", req.Offset)
+	var sb strings.Builder
+	args := []any{}
+
+	// SELECT
+	if req.Aggregate != nil {
+		sb.WriteString("SELECT ")
+		sb.WriteString(req.Aggregate.Type)
+		sb.WriteString("(")
+		sb.WriteString(req.Aggregate.Column)
+		sb.WriteString(")")
+	} else if len(req.Projection) > 0 {
+		sb.WriteString("SELECT ")
+		for i, c := range req.Projection {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(sql.QuoteIdent(c))
+		}
+	} else {
+		sb.WriteString("SELECT *")
+	}
+
+	sb.WriteString(" FROM ")
+	sb.WriteString(sql.QuoteIdent(req.DBName))
+	sb.WriteString(".")
+	sb.WriteString(sql.QuoteIdent(req.Table))
+
+	// WHERE（直接信任 where_json）
+	if req.Where != nil {
+		sb.WriteString(" WHERE ")
+		whereSQL := whereExprToSQL(req.Where)
+		if whereSQL != "" {
+			sb.WriteString(whereSQL)
+		}
+	}
+
+	// ORDER BY
+	if len(req.OrderBy) > 0 {
+		sb.WriteString(" ORDER BY ")
+		for i, ob := range req.OrderBy {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(sql.QuoteIdent(ob.Col))
+			if ob.Desc {
+				sb.WriteString(" DESC")
+			}
+		}
+	}
+
+	if req.Limit > 0 {
+		sb.WriteString(" LIMIT ")
+		sb.WriteString(strconv.FormatUint(req.Limit, 10))
+	}
+	if req.Offset > 0 {
+		sb.WriteString(" OFFSET ")
+		sb.WriteString(strconv.FormatUint(req.Offset, 10))
+	}
+	log.Println(sb.String())
+	query, err := sql.MyDB.Query(sb.String(), args...)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	defer query.Close()
+	cols, _ := query.Columns()
+	colTypes, _ := query.ColumnTypes()
+
+	var seq uint8 = 0
+
+	// Column count
+	_ = build.WritePacket(conn, &seq,
+		mysql.PutLengthEncodedInt(uint64(len(cols))))
+
+	// Rows
+	values := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	i := 0
+	for query.Next() {
+		query.Scan(ptrs...)
+		row, fields, _ := build.MakeBinaryRow1(values, i, cols)
+		if i == 0 {
+			writeFields(fields, &seq, conn)
+		}
+		_ = build.WritePacket(conn, &seq, row)
+		i = i + 1
+	}
+	build.WriteEOF(conn, &seq)
+	//如果数据为空则返回字段名
+	if i == 0 {
+		build.WriteColumnNames(cols, conn, colTypes, &seq)
+	}
+}
+
+func writeFields(fields []*mysql.Field, seq *uint8, conn net.Conn) {
+	for _, field := range fields {
+		_ = build.WritePacket(conn, seq, field.Dump())
+	}
+	build.WriteEOF(conn, seq)
+}
+
+func handlePointGet(conn net.Conn, req Request) {
+	log.Printf("[POINT_GET] table=%s row_id=%s", req.Table, req.RowID)
+	sqlStr := ""
+	args := []any{}
+	// 增加索引查询的兼容度
+	if req.KeyData != nil {
+		var sb strings.Builder
+		sb.WriteString("SELECT *")
+		sb.WriteString(" FROM ")
+		sb.WriteString(sql.QuoteIdent(req.DBName))
+		sb.WriteString(".")
+		sb.WriteString(sql.QuoteIdent(req.Table))
+		sb.WriteString(" WHERE ")
+		i := 0
+		for k, v := range req.KeyData {
+			if i > 0 {
+				sb.WriteString(" AND ")
+			}
+			sb.WriteString(sql.QuoteIdent(k))
+			sb.WriteString(" = ? ")
+			args = append(args, v)
+			i = i + 1
+		}
+		sqlStr = sb.String()
+	} else {
+		sqlStr = fmt.Sprintf(
+			"SELECT * FROM %s WHERE id = ? LIMIT 1",
+			sql.QuoteIdent(req.Table),
+		)
+		args = append(args, req.RowID)
+	}
+	log.Printf("[POINT_GET] sql=%s args=%v", sqlStr, args)
+	queryRow, err := sql.MyDB.Query(sqlStr, args...)
+	defer queryRow.Close()
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	cols, _ := queryRow.Columns()
+	colTypes, _ := queryRow.ColumnTypes()
+	var seq uint8 = 0
+	// 写返回列
+	_ = build.WritePacket(conn, &seq,
+		mysql.PutLengthEncodedInt(uint64(len(cols))))
+
+	// Rows
+	values := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	i := 0
+	for queryRow.Next() {
+		queryRow.Scan(ptrs...)
+		row, fields, _ := build.MakeBinaryRow1(values, i, cols)
+		if i == 0 {
+			writeFields(fields, &seq, conn)
+		}
+		_ = build.WritePacket(conn, &seq, row)
+		i = i + 1
+	}
+	//如果数据为空则返回字段名
+	if i == 0 {
+		build.WriteColumnNames(cols, conn, colTypes, &seq)
+	}
+	build.WriteEOF(conn, &seq)
+}
+
+func handleInsert(conn net.Conn, req Request) {
+	log.Println("[INSERT]")
+	log.Printf("  table = %s", req.Table)
+	log.Printf("  row   = %v", req.Row)
+	log.Printf("  projection = %v", req.Projection)
+
+	proj := projectionSet(req.Projection)
+	row := filterByProjection(req.Row, proj)
+
+	var cols []string
+	var vals []interface{}
+
+	for k, v := range row {
+		cols = append(cols, sql.QuoteIdent(k))
+		vals = append(vals, v)
+	}
+
+	sqlStr := fmt.Sprintf(
+		"INSERT INTO %s.%s (%s) VALUES (%s)",
+		sql.QuoteIdent(req.DBName),
+		sql.QuoteIdent(req.Table),
+		strings.Join(cols, ","),
+		sql.Placeholders(len(cols)),
+	)
+
+	log.Printf("INSERT  SQL = %s", sqlStr)
+	exec, err := sql.MyDB.Exec(sqlStr, vals...)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	id, err := exec.LastInsertId()
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+
+	affected, err := exec.RowsAffected()
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	var seq uint8 = 0
+	payload := buildOKPayload(uint64(affected), uint64(id), 0x0002, 0, "")
+	build.WritePacket(conn, &seq, payload)
+}
+
+func handleUpdate(conn net.Conn, req Request) {
+	log.Println("[UPDATE]")
+	log.Printf("  table     = %s", req.Table)
+	log.Printf("  set       = %v", req.Set)
+	log.Printf("  where_row = %v", req.WhereRow)
+	log.Printf("  projection = %v", req.Projection)
+
+	proj := projectionSet(req.Projection)
+
+	set := filterByProjection(req.Set, proj)
+	where := filterByProjection(req.WhereRow, proj)
+
+	var sets []string
+	var args []any
+
+	for k, v := range set {
+		sets = append(sets, sql.QuoteIdent(k)+"=?")
+		args = append(args, v)
+	}
+
+	var cond []string
+	for k, v := range where {
+		if v == nil {
+			cond = append(cond, sql.QuoteIdent(k)+"IS NULL")
+		} else {
+			cond = append(cond, sql.QuoteIdent(k)+"=?")
+			args = append(args, v)
+		}
+	}
+
+	sqlStr := fmt.Sprintf(
+		"UPDATE %s.%s SET %s WHERE %s",
+		sql.QuoteIdent(req.DBName),
+		sql.QuoteIdent(req.Table),
+		strings.Join(sets, ","),
+		strings.Join(cond, " AND "),
+	)
+
+	log.Printf("UPDATE  SQL = %s", sqlStr)
+
+	exec, err := sql.MyDB.Exec(sqlStr, args...)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	affected, err := exec.RowsAffected()
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	var seq uint8 = 0
+	payload := buildOKPayload(uint64(affected), uint64(0), 0x0002, 0, "")
+	build.WritePacket(conn, &seq, payload)
+}
+
+func handleDelete(conn net.Conn, req Request) {
+	log.Println("[DELETE]")
+	log.Printf("  table      = %s", req.Table)
+	log.Printf("  row        = %v", req.Row)
+	log.Printf("  projection = %v", req.Projection)
+
+	// Projection 为空 ⇒ 无条件删除
+	if len(req.Projection) == 0 {
+		sql := fmt.Sprintf("DELETE FROM %s", req.Table)
+		log.Printf("  SQL = %s", sql)
+		sendOK(conn)
+		return
+	}
+
+	// Projection 非空 ⇒ 只使用 projection ∩ row
+	proj := projectionSet(req.Projection)
+	where := filterByProjection(req.Row, proj)
+
+	var cond []string
+	var args []any
+
+	for k, v := range where {
+		if v == nil {
+			cond = append(cond, sql.QuoteIdent(k)+"IS NULL")
+		} else {
+			cond = append(cond, sql.QuoteIdent(k)+"=?")
+			args = append(args, v)
+		}
+	}
+	sqlStr := ""
+	if len(where) == 0 {
+		sqlStr = fmt.Sprintf(
+			"DELETE FROM %s.%s",
+			sql.QuoteIdent(req.DBName),
+			sql.QuoteIdent(req.Table),
+		)
+	} else {
+		sqlStr = fmt.Sprintf(
+			"DELETE FROM %s.%s WHERE %s",
+			sql.QuoteIdent(req.DBName),
+			sql.QuoteIdent(req.Table),
+			strings.Join(cond, " AND "),
+		)
+	}
+
+	log.Printf("DELETE  SQL = %s", sqlStr)
+
+	exec, err := sql.MyDB.Exec(sqlStr, args...)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	affected, err := exec.RowsAffected()
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	var seq uint8 = 0
+	payload := buildOKPayload(uint64(affected), uint64(0), 0x0002, 0, "")
+	build.WritePacket(conn, &seq, payload)
+}
+
+func whereExprToSQL(e *WhereExpr) string {
+	if e == nil {
+		return ""
+	}
+
+	switch e.Type {
+	case "and":
+		var parts []string
+		for _, a := range e.Args {
+			parts = append(parts, whereExprToSQL(&a))
+		}
+		return "(" + strings.Join(parts, " AND ") + ")"
+
+	case "or":
+		var parts []string
+		for _, a := range e.Args {
+			parts = append(parts, whereExprToSQL(&a))
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+
+	case "cmp":
+		if e.Left == nil || e.Right == nil {
+			return ""
+		}
+		col := e.Left.Name
+		val := sqlLiteral(e.Right.Value)
+		return fmt.Sprintf("%s %s %s", col, e.Op, val)
+	}
+
+	return ""
+}
+
+func sqlLiteral(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		// 简化版，demo 用；生产要处理转义
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case int, int32, int64:
+		return fmt.Sprintf("%d", x)
+	case float32, float64:
+		return fmt.Sprintf("%v", x)
+	default:
+		return "'" + fmt.Sprintf("%v", x) + "'"
+	}
+}
