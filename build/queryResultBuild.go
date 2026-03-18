@@ -4,12 +4,14 @@ import (
 	"bytes"
 	sql2 "database/sql"
 	"encoding/binary"
+	"fmt"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/utils"
 	"github.com/pingcap/errors"
 	"log"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -114,6 +116,79 @@ func Uint64ToBytes(n uint64) []byte {
 	}
 }
 
+func appendUintN(row []byte, n uint64, size int) []byte {
+	for i := 0; i < size; i++ {
+		row = append(row, byte(n>>(8*i)))
+	}
+	return row
+}
+
+func toUint64(value interface{}) (uint64, error) {
+	switch v := value.(type) {
+	case int8:
+		return uint64(v), nil
+	case int16:
+		return uint64(v), nil
+	case int32:
+		return uint64(v), nil
+	case int64:
+		return uint64(v), nil
+	case int:
+		return uint64(v), nil
+	case uint8:
+		return uint64(v), nil
+	case uint16:
+		return uint64(v), nil
+	case uint32:
+		return uint64(v), nil
+	case uint64:
+		return v, nil
+	case uint:
+		return uint64(v), nil
+	case bool:
+		if v {
+			return 1, nil
+		}
+		return 0, nil
+	case []byte:
+		return strconv.ParseUint(string(v), 10, 64)
+	case string:
+		return strconv.ParseUint(v, 10, 64)
+	default:
+		return 0, errors.Errorf("invalid integer type %T", value)
+	}
+}
+
+func toFloat64(value interface{}) (float64, error) {
+	switch v := value.(type) {
+	case float32:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case []byte:
+		return strconv.ParseFloat(string(v), 64)
+	case string:
+		return strconv.ParseFloat(v, 64)
+	default:
+		n, err := toUint64(value)
+		if err != nil {
+			return 0, errors.Errorf("invalid float type %T", value)
+		}
+		return float64(n), nil
+	}
+}
+
+func toBytes(value interface{}) ([]byte, error) {
+	switch v := value.(type) {
+	case []byte:
+		return v, nil
+	case string:
+		return []byte(v), nil
+	default:
+		return []byte(fmt.Sprintf("%v", value)), nil
+	}
+}
+
 func toBinaryDateTime(t time.Time) ([]byte, error) {
 	var buf bytes.Buffer
 
@@ -195,51 +270,107 @@ func formatBinaryValue(value interface{}) ([]byte, error) {
 }
 
 // 参考/github.com/go-mysql-org/go-mysql@v1.13.0/mysql/resultset_helper.go:233
-func MakeBinaryRow1(values []interface{}, i int, names []string) ([]byte, []*mysql.Field, error) {
-	//valuess := [][]interface{}{values}
-	//var returnData []byte
-	var b []byte
-	bitmapLen := (len(values) + 7 + 2) >> 3
+func MakeBinaryRow1(values []interface{}, colTypes []*sql2.ColumnType) ([]byte, error) {
+	if len(values) != len(colTypes) {
+		return nil, errors.Errorf("values count %d != column count %d", len(values), len(colTypes))
+	}
 
-	var row []byte
+	bitmapLen := (len(values) + 7 + 2) >> 3
 	nullBitmap := make([]byte, bitmapLen)
 
+	var row []byte
 	row = append(row, 0)
 	row = append(row, nullBitmap...)
-	var fields []*mysql.Field
-	for j, value := range values {
-		field := &mysql.Field{}
-		typ, err := fieldType(value)
-		if err != nil {
-			return nil, fields, errors.Trace(err)
-		}
-		if i == 0 {
-			field.Type = typ
-			field.Name = utils.StringToByteSlice(names[j])
 
-			if err = formatField(field, value); err != nil {
-				return nil, fields, errors.Trace(err)
-			}
-			fields = append(fields, field)
-		}
+	for j, value := range values {
 		if value == nil {
 			nullBitmap[(j+2)/8] |= 1 << (uint(j+2) % 8)
 			continue
 		}
 
-		b, err = formatBinaryValue(value)
+		typ := mysqlTypeFromDatabaseType(colTypes[j])
+		var err error
+		row, err = appendBinaryValueByType(row, value, typ)
 		if err != nil {
-			return nil, fields, errors.Trace(err)
-		}
-		if typ == mysql.MYSQL_TYPE_VAR_STRING {
-			row = append(row, mysql.PutLengthEncodedString(b)...)
-		} else {
-			row = append(row, b...)
+			return nil, errors.Trace(err)
 		}
 	}
-	copy(row[1:], nullBitmap)
 
-	return row, fields, nil
+	copy(row[1:], nullBitmap)
+	return row, nil
+}
+
+func appendBinaryValueByType(row []byte, value interface{}, typ byte) ([]byte, error) {
+	switch typ {
+	case mysql.MYSQL_TYPE_TINY:
+		n, err := toUint64(value)
+		if err != nil {
+			return nil, err
+		}
+		return append(row, byte(n)), nil
+	case mysql.MYSQL_TYPE_SHORT, mysql.MYSQL_TYPE_YEAR:
+		n, err := toUint64(value)
+		if err != nil {
+			return nil, err
+		}
+		return appendUintN(row, n, 2), nil
+	case mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_INT24:
+		n, err := toUint64(value)
+		if err != nil {
+			return nil, err
+		}
+		return appendUintN(row, n, 4), nil
+	case mysql.MYSQL_TYPE_LONGLONG:
+		n, err := toUint64(value)
+		if err != nil {
+			return nil, err
+		}
+		return appendUintN(row, n, 8), nil
+	case mysql.MYSQL_TYPE_FLOAT:
+		f, err := toFloat64(value)
+		if err != nil {
+			return nil, err
+		}
+		return appendUintN(row, uint64(math.Float32bits(float32(f))), 4), nil
+	case mysql.MYSQL_TYPE_DOUBLE:
+		f, err := toFloat64(value)
+		if err != nil {
+			return nil, err
+		}
+		return appendUintN(row, math.Float64bits(f), 8), nil
+	case mysql.MYSQL_TYPE_DATE, mysql.MYSQL_TYPE_DATETIME, mysql.MYSQL_TYPE_TIMESTAMP:
+		t, ok := value.(time.Time)
+		if !ok {
+			return nil, errors.Errorf("invalid temporal type %T", value)
+		}
+		b, err := toBinaryDateTime(t)
+		if err != nil {
+			return nil, err
+		}
+		return append(row, b...), nil
+	case mysql.MYSQL_TYPE_TIME,
+		mysql.MYSQL_TYPE_DECIMAL,
+		mysql.MYSQL_TYPE_NEWDECIMAL,
+		mysql.MYSQL_TYPE_BIT,
+		mysql.MYSQL_TYPE_BLOB,
+		mysql.MYSQL_TYPE_TINY_BLOB,
+		mysql.MYSQL_TYPE_MEDIUM_BLOB,
+		mysql.MYSQL_TYPE_LONG_BLOB,
+		mysql.MYSQL_TYPE_STRING,
+		mysql.MYSQL_TYPE_VARCHAR,
+		mysql.MYSQL_TYPE_VAR_STRING,
+		mysql.MYSQL_TYPE_JSON,
+		mysql.MYSQL_TYPE_GEOMETRY,
+		mysql.MYSQL_TYPE_ENUM,
+		mysql.MYSQL_TYPE_SET:
+		b, err := toBytes(value)
+		if err != nil {
+			return nil, err
+		}
+		return append(row, mysql.PutLengthEncodedString(b)...), nil
+	default:
+		return nil, errors.Errorf("unsupported column type %d for value %T", typ, value)
+	}
 }
 
 func formatField(field *mysql.Field, value interface{}) error {

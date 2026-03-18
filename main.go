@@ -317,6 +317,7 @@ func handleRaw(conn net.Conn, req Request) {
 	// Column count
 	_ = build.WritePacket(conn, &seq,
 		mysql.PutLengthEncodedInt(uint64(len(cols))))
+	build.WriteColumnNames(cols, conn, colTypes, &seq)
 
 	// Rows
 	values := make([]interface{}, len(cols))
@@ -328,18 +329,16 @@ func handleRaw(conn net.Conn, req Request) {
 	i := 0
 	for query.Next() {
 		query.Scan(ptrs...)
-		row, fields, _ := build.MakeBinaryRow1(values, i, cols)
-		if i == 0 {
-			writeFields(fields, &seq, conn)
+		row, err := build.MakeBinaryRow1(values, colTypes)
+		if err != nil {
+			log.Printf("[ERR] build RAW row failed: %v", err)
+			return
 		}
 		_ = build.WritePacket(conn, &seq, row)
 		i = i + 1
 	}
 	build.WriteEOF(conn, &seq)
 	//如果数据为空则返回字段名
-	if i == 0 {
-		build.WriteColumnNames(cols, conn, colTypes, &seq)
-	}
 }
 
 func handleOpen(conn net.Conn, req Request) {
@@ -421,6 +420,7 @@ func handleOpen(conn net.Conn, req Request) {
 	// Column count
 	_ = build.WritePacket(conn, &seq,
 		mysql.PutLengthEncodedInt(uint64(len(cols))))
+	build.WriteColumnNames(cols, conn, colTypes, &seq)
 
 	// Rows
 	values := make([]interface{}, len(cols))
@@ -432,18 +432,16 @@ func handleOpen(conn net.Conn, req Request) {
 	i := 0
 	for query.Next() {
 		query.Scan(ptrs...)
-		row, fields, _ := build.MakeBinaryRow1(values, i, cols)
-		if i == 0 {
-			writeFields(fields, &seq, conn)
+		row, err := build.MakeBinaryRow1(values, colTypes)
+		if err != nil {
+			log.Printf("[ERR] build OPEN row failed: %v", err)
+			return
 		}
 		_ = build.WritePacket(conn, &seq, row)
 		i = i + 1
 	}
 	build.WriteEOF(conn, &seq)
 	//如果数据为空则返回字段名
-	if i == 0 {
-		build.WriteColumnNames(cols, conn, colTypes, &seq)
-	}
 }
 
 func writeFields(fields []*mysql.Field, seq *uint8, conn net.Conn) {
@@ -497,6 +495,7 @@ func handlePointGet(conn net.Conn, req Request) {
 	// 写返回列
 	_ = build.WritePacket(conn, &seq,
 		mysql.PutLengthEncodedInt(uint64(len(cols))))
+	build.WriteColumnNames(cols, conn, colTypes, &seq)
 
 	// Rows
 	values := make([]interface{}, len(cols))
@@ -507,17 +506,15 @@ func handlePointGet(conn net.Conn, req Request) {
 	i := 0
 	for queryRow.Next() {
 		queryRow.Scan(ptrs...)
-		row, fields, _ := build.MakeBinaryRow1(values, i, cols)
-		if i == 0 {
-			writeFields(fields, &seq, conn)
+		row, err := build.MakeBinaryRow1(values, colTypes)
+		if err != nil {
+			log.Printf("[ERR] build POINT_GET row failed: %v", err)
+			return
 		}
 		_ = build.WritePacket(conn, &seq, row)
 		i = i + 1
 	}
 	//如果数据为空则返回字段名
-	if i == 0 {
-		build.WriteColumnNames(cols, conn, colTypes, &seq)
-	}
 	build.WriteEOF(conn, &seq)
 }
 
