@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	driverMysql "github.com/go-sql-driver/mysql"
 	"io"
 	"log"
 	"net"
@@ -209,10 +211,51 @@ func buildOKPayload(
 	return payload
 }
 
-func sendError(conn net.Conn, msg string) {
+func sendErrorPacket(conn net.Conn, errno uint16, sqlState string, msg string) {
 	var seq uint8 = 0
-	payload := append([]byte{0xFF, 0x00, 0x00}, []byte(msg)...)
+	payload := []byte{0xFF, byte(errno), byte(errno >> 8)}
+	if sqlState == "" {
+		sqlState = "HY000"
+	}
+	if len(sqlState) < 5 {
+		sqlState += strings.Repeat("0", 5-len(sqlState))
+	}
+	payload = append(payload, '#')
+	payload = append(payload, []byte(sqlState[:5])...)
+	payload = append(payload, []byte(msg)...)
 	_ = build.WritePacket(conn, &seq, payload)
+}
+
+func fallbackSQLState(errno uint16) string {
+	switch errno {
+	case 1062:
+		return "23000"
+	default:
+		return "HY000"
+	}
+}
+
+func sendError(conn net.Conn, msg string) {
+	sendErrorPacket(conn, 1105, "HY000", msg)
+}
+
+func sendDBError(conn net.Conn, err error) {
+	if err == nil {
+		sendError(conn, "unknown database error")
+		return
+	}
+
+	var mysqlErr *driverMysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		sqlState := string(mysqlErr.SQLState[:])
+		if strings.Trim(sqlState, "\x00") == "" {
+			sqlState = fallbackSQLState(mysqlErr.Number)
+		}
+		sendErrorPacket(conn, mysqlErr.Number, sqlState, mysqlErr.Message)
+		return
+	}
+
+	sendError(conn, err.Error())
 }
 
 /* ======================================================
@@ -262,7 +305,7 @@ func handleRaw(conn net.Conn, req Request) {
 	log.Printf("RAW  SQL = %s", req.Sql)
 	query, err := sql.MyDB.Query(req.Sql)
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	defer query.Close()
@@ -366,7 +409,7 @@ func handleOpen(conn net.Conn, req Request) {
 	log.Println(sb.String())
 	query, err := sql.MyDB.Query(sb.String(), args...)
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	defer query.Close()
@@ -443,11 +486,11 @@ func handlePointGet(conn net.Conn, req Request) {
 	}
 	log.Printf("[POINT_GET] sql=%s args=%v", sqlStr, args)
 	queryRow, err := sql.MyDB.Query(sqlStr, args...)
-	defer queryRow.Close()
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
+	defer queryRow.Close()
 	cols, _ := queryRow.Columns()
 	colTypes, _ := queryRow.ColumnTypes()
 	var seq uint8 = 0
@@ -506,18 +549,18 @@ func handleInsert(conn net.Conn, req Request) {
 	log.Printf("INSERT  SQL = %s", sqlStr)
 	exec, err := sql.MyDB.Exec(sqlStr, vals...)
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	id, err := exec.LastInsertId()
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 
 	affected, err := exec.RowsAffected()
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	var seq uint8 = 0
@@ -567,12 +610,12 @@ func handleUpdate(conn net.Conn, req Request) {
 
 	exec, err := sql.MyDB.Exec(sqlStr, args...)
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	affected, err := exec.RowsAffected()
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	var seq uint8 = 0
@@ -629,12 +672,12 @@ func handleDelete(conn net.Conn, req Request) {
 
 	exec, err := sql.MyDB.Exec(sqlStr, args...)
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	affected, err := exec.RowsAffected()
 	if err != nil {
-		sendError(conn, err.Error())
+		sendDBError(conn, err)
 		return
 	}
 	var seq uint8 = 0
