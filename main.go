@@ -1,6 +1,7 @@
 package main
 
 import (
+	stdsql "database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,6 +73,59 @@ type Request struct {
 	Sql string `json:"sql,omitempty"`
 }
 
+type queryExecutor interface {
+	Exec(query string, args ...any) (stdsql.Result, error)
+	Query(query string, args ...any) (*stdsql.Rows, error)
+}
+
+type Session struct {
+	tx *stdsql.Tx
+}
+
+func (s *Session) executor() queryExecutor {
+	if s != nil && s.tx != nil {
+		return s.tx
+	}
+	return sql.MyDB
+}
+
+func (s *Session) statusFlags() uint16 {
+	if s != nil && s.tx != nil {
+		return 0x0001
+	}
+	return 0x0002
+}
+
+func (s *Session) begin() error {
+	if s.tx != nil {
+		return errors.New("transaction already active")
+	}
+	tx, err := sql.MyDB.Begin()
+	if err != nil {
+		return err
+	}
+	s.tx = tx
+	return nil
+}
+
+func (s *Session) commit() error {
+	if s.tx == nil {
+		return nil
+	}
+	err := s.tx.Commit()
+	s.tx = nil
+	return err
+}
+
+func (s *Session) rollback() error {
+	if s.tx == nil {
+		return nil
+	}
+	err := s.tx.Rollback()
+	s.tx = nil
+	return err
+}
+
 /* ======================================================
  * Entry
  * ====================================================== */
@@ -102,6 +156,12 @@ func main() {
 func handleConn(conn net.Conn) {
 
 	defer conn.Close()
+	session := &Session{}
+	defer func() {
+		if err := session.rollback(); err != nil {
+			log.Printf("[WARN] rollback on close failed: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(conn)
 
@@ -127,17 +187,23 @@ func handleConn(conn net.Conn) {
 		)
 		switch req.Op {
 		case "OPEN":
-			handleOpen(conn, req)
+			handleOpen(conn, session, req)
 		case "INSERT":
-			handleInsert(conn, req)
+			handleInsert(conn, session, req)
 		case "UPDATE":
-			handleUpdate(conn, req)
+			handleUpdate(conn, session, req)
 		case "DELETE":
-			handleDelete(conn, req)
+			handleDelete(conn, session, req)
 		case "POINT_GET":
-			handlePointGet(conn, req)
+			handlePointGet(conn, session, req)
 		case "RAW":
-			handleRaw(conn, req)
+			handleRaw(conn, session, req)
+		case "TX_BEGIN":
+			handleTxBegin(conn, session)
+		case "TX_COMMIT":
+			handleTxCommit(conn, session)
+		case "TX_ROLLBACK":
+			handleTxRollback(conn, session)
 		default:
 			sendError(conn, "unknown op")
 		}
@@ -296,14 +362,44 @@ func filterByProjection(
 /* ======================================================
  * Handlers
  * ====================================================== */
-func handleRaw(conn net.Conn, req Request) {
+func handleTxBegin(conn net.Conn, session *Session) {
+	if err := session.begin(); err != nil {
+		sendDBError(conn, err)
+		return
+	}
+	var seq uint8 = 0
+	payload := buildOKPayload(0, 0, session.statusFlags(), 0, "")
+	build.WritePacket(conn, &seq, payload)
+}
+
+func handleTxCommit(conn net.Conn, session *Session) {
+	if err := session.commit(); err != nil {
+		sendDBError(conn, err)
+		return
+	}
+	var seq uint8 = 0
+	payload := buildOKPayload(0, 0, session.statusFlags(), 0, "")
+	build.WritePacket(conn, &seq, payload)
+}
+
+func handleTxRollback(conn net.Conn, session *Session) {
+	if err := session.rollback(); err != nil {
+		sendDBError(conn, err)
+		return
+	}
+	var seq uint8 = 0
+	payload := buildOKPayload(0, 0, session.statusFlags(), 0, "")
+	build.WritePacket(conn, &seq, payload)
+}
+
+func handleRaw(conn net.Conn, session *Session, req Request) {
 	log.Println("[OPEN]")
 	log.Printf("  table      = %s", req.Table)
 	log.Printf("  DBName 	= %s", req.DBName)
 	log.Printf("  sql      	= %s", req.Sql)
 
 	log.Printf("RAW  SQL = %s", req.Sql)
-	query, err := sql.MyDB.Query(req.Sql)
+	query, err := session.executor().Query(req.Sql)
 	if err != nil {
 		sendDBError(conn, err)
 		return
@@ -341,7 +437,7 @@ func handleRaw(conn net.Conn, req Request) {
 	//如果数据为空则返回字段名
 }
 
-func handleOpen(conn net.Conn, req Request) {
+func handleOpen(conn net.Conn, session *Session, req Request) {
 	log.Println("[OPEN]")
 	log.Printf("  table      = %s", req.Table)
 	log.Printf("  projection = %v", req.Projection)
@@ -406,7 +502,7 @@ func handleOpen(conn net.Conn, req Request) {
 		sb.WriteString(strconv.FormatUint(req.Offset, 10))
 	}
 	log.Println(sb.String())
-	query, err := sql.MyDB.Query(sb.String(), args...)
+	query, err := session.executor().Query(sb.String(), args...)
 	if err != nil {
 		sendDBError(conn, err)
 		return
@@ -451,7 +547,7 @@ func writeFields(fields []*mysql.Field, seq *uint8, conn net.Conn) {
 	build.WriteEOF(conn, seq)
 }
 
-func handlePointGet(conn net.Conn, req Request) {
+func handlePointGet(conn net.Conn, session *Session, req Request) {
 	log.Printf("[POINT_GET] table=%s row_id=%s", req.Table, req.RowID)
 	sqlStr := ""
 	args := []any{}
@@ -483,7 +579,7 @@ func handlePointGet(conn net.Conn, req Request) {
 		args = append(args, req.RowID)
 	}
 	log.Printf("[POINT_GET] sql=%s args=%v", sqlStr, args)
-	queryRow, err := sql.MyDB.Query(sqlStr, args...)
+	queryRow, err := session.executor().Query(sqlStr, args...)
 	if err != nil {
 		sendDBError(conn, err)
 		return
@@ -518,7 +614,7 @@ func handlePointGet(conn net.Conn, req Request) {
 	build.WriteEOF(conn, &seq)
 }
 
-func handleInsert(conn net.Conn, req Request) {
+func handleInsert(conn net.Conn, session *Session, req Request) {
 	log.Println("[INSERT]")
 	log.Printf("  table = %s", req.Table)
 	log.Printf("  row   = %v", req.Row)
@@ -544,7 +640,7 @@ func handleInsert(conn net.Conn, req Request) {
 	)
 
 	log.Printf("INSERT  SQL = %s", sqlStr)
-	exec, err := sql.MyDB.Exec(sqlStr, vals...)
+	exec, err := session.executor().Exec(sqlStr, vals...)
 	if err != nil {
 		sendDBError(conn, err)
 		return
@@ -561,11 +657,11 @@ func handleInsert(conn net.Conn, req Request) {
 		return
 	}
 	var seq uint8 = 0
-	payload := buildOKPayload(uint64(affected), uint64(id), 0x0002, 0, "")
+	payload := buildOKPayload(uint64(affected), uint64(id), session.statusFlags(), 0, "")
 	build.WritePacket(conn, &seq, payload)
 }
 
-func handleUpdate(conn net.Conn, req Request) {
+func handleUpdate(conn net.Conn, session *Session, req Request) {
 	log.Println("[UPDATE]")
 	log.Printf("  table     = %s", req.Table)
 	log.Printf("  set       = %v", req.Set)
@@ -605,7 +701,7 @@ func handleUpdate(conn net.Conn, req Request) {
 
 	log.Printf("UPDATE  SQL = %s", sqlStr)
 
-	exec, err := sql.MyDB.Exec(sqlStr, args...)
+	exec, err := session.executor().Exec(sqlStr, args...)
 	if err != nil {
 		sendDBError(conn, err)
 		return
@@ -616,11 +712,11 @@ func handleUpdate(conn net.Conn, req Request) {
 		return
 	}
 	var seq uint8 = 0
-	payload := buildOKPayload(uint64(affected), uint64(0), 0x0002, 0, "")
+	payload := buildOKPayload(uint64(affected), uint64(0), session.statusFlags(), 0, "")
 	build.WritePacket(conn, &seq, payload)
 }
 
-func handleDelete(conn net.Conn, req Request) {
+func handleDelete(conn net.Conn, session *Session, req Request) {
 	log.Println("[DELETE]")
 	log.Printf("  table      = %s", req.Table)
 	log.Printf("  row        = %v", req.Row)
@@ -667,7 +763,7 @@ func handleDelete(conn net.Conn, req Request) {
 
 	log.Printf("DELETE  SQL = %s", sqlStr)
 
-	exec, err := sql.MyDB.Exec(sqlStr, args...)
+	exec, err := session.executor().Exec(sqlStr, args...)
 	if err != nil {
 		sendDBError(conn, err)
 		return
@@ -678,7 +774,7 @@ func handleDelete(conn net.Conn, req Request) {
 		return
 	}
 	var seq uint8 = 0
-	payload := buildOKPayload(uint64(affected), uint64(0), 0x0002, 0, "")
+	payload := buildOKPayload(uint64(affected), uint64(0), session.statusFlags(), 0, "")
 	build.WritePacket(conn, &seq, payload)
 }
 
