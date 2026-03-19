@@ -16,21 +16,40 @@ import (
 	"time"
 )
 
+const (
+	textCharset   = 33
+	binaryCharset = 63
+)
+
 func WriteColumnNames(cols []string, conn net.Conn, colTypes []*sql2.ColumnType, seq *uint8) {
 	// Column definitions
 	for i, c := range cols {
 		log.Println(c)
-		field := &mysql.Field{
-			Name: []byte(c),
-			Type: mysqlTypeFromDatabaseType(colTypes[i]),
-		}
+		field := buildColumnField(c, colTypes[i])
 		_ = WritePacket(conn, seq, field.Dump())
 	}
 	WriteEOF(conn, seq)
 }
 
+func buildColumnField(name string, ct *sql2.ColumnType) *mysql.Field {
+	field := &mysql.Field{
+		Name: []byte(name),
+		Type: mysqlTypeFromDatabaseType(ct),
+	}
+	applyColumnMetadata(field, ct)
+	return field
+}
+
+func normalizeDatabaseTypeName(ct *sql2.ColumnType) string {
+	t := strings.ToUpper(strings.TrimSpace(ct.DatabaseTypeName()))
+	t = strings.TrimPrefix(t, "UNSIGNED ")
+	t = strings.TrimSuffix(t, " UNSIGNED")
+	t = strings.TrimSuffix(t, " ZEROFILL")
+	return strings.TrimSpace(t)
+}
+
 func mysqlTypeFromDatabaseType(ct *sql2.ColumnType) byte {
-	t := strings.ToUpper(ct.DatabaseTypeName())
+	t := normalizeDatabaseTypeName(ct)
 
 	switch t {
 
@@ -100,6 +119,40 @@ func mysqlTypeFromDatabaseType(ct *sql2.ColumnType) byte {
 
 	default:
 		return mysql.MYSQL_TYPE_VAR_STRING
+	}
+}
+
+func applyColumnMetadata(field *mysql.Field, ct *sql2.ColumnType) {
+	t := normalizeDatabaseTypeName(ct)
+
+	if nullable, ok := ct.Nullable(); ok && !nullable {
+		field.Flag |= mysql.NOT_NULL_FLAG
+	}
+
+	switch t {
+	case "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT",
+		"CHAR", "VARCHAR", "ENUM", "SET", "JSON",
+		"DATE", "TIME", "DATETIME", "TIMESTAMP":
+		field.Charset = textCharset
+
+	case "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB",
+		"BINARY", "VARBINARY", "GEOMETRY":
+		field.Charset = binaryCharset
+		field.Flag |= mysql.BINARY_FLAG
+
+	case "TINYINT", "BOOL", "BOOLEAN",
+		"SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT",
+		"FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "YEAR", "BIT":
+		field.Charset = binaryCharset
+		field.Flag |= mysql.BINARY_FLAG
+
+	default:
+		field.Charset = textCharset
+	}
+
+	rawTypeName := strings.ToUpper(strings.TrimSpace(ct.DatabaseTypeName()))
+	if strings.Contains(rawTypeName, "UNSIGNED") {
+		field.Flag |= mysql.UNSIGNED_FLAG
 	}
 }
 
