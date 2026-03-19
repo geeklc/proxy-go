@@ -2,6 +2,7 @@ package main
 
 import (
 	stdsql "database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -359,6 +360,59 @@ func filterByProjection(
 	return out
 }
 
+func normalizeShadowValue(v any) (any, error) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v, nil
+	}
+
+	rawType, ok := m["__shadow_type"]
+	if !ok {
+		return v, nil
+	}
+
+	shadowType, ok := rawType.(string)
+	if !ok || shadowType != "blob" {
+		return v, nil
+	}
+
+	encoding, ok := m["encoding"].(string)
+	if !ok {
+		return nil, errors.New("blob value missing encoding")
+	}
+	if encoding != "base64" {
+		return nil, fmt.Errorf("unsupported blob encoding: %s", encoding)
+	}
+
+	data, ok := m["data"].(string)
+	if !ok {
+		return nil, errors.New("blob value missing data")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode blob base64 failed: %w", err)
+	}
+
+	return decoded, nil
+}
+
+func normalizeShadowMapValues(input map[string]interface{}) (map[string]interface{}, error) {
+	if input == nil {
+		return nil, nil
+	}
+
+	out := make(map[string]interface{}, len(input))
+	for k, v := range input {
+		normalized, err := normalizeShadowValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("column %s: %w", k, err)
+		}
+		out[k] = normalized
+	}
+	return out, nil
+}
+
 /* ======================================================
  * Handlers
  * ====================================================== */
@@ -553,6 +607,11 @@ func handlePointGet(conn net.Conn, session *Session, req Request) {
 	args := []any{}
 	// 增加索引查询的兼容度
 	if req.KeyData != nil {
+		normalizedKeyData, err := normalizeShadowMapValues(req.KeyData)
+		if err != nil {
+			sendError(conn, err.Error())
+			return
+		}
 		var sb strings.Builder
 		sb.WriteString("SELECT *")
 		sb.WriteString(" FROM ")
@@ -561,7 +620,7 @@ func handlePointGet(conn net.Conn, session *Session, req Request) {
 		sb.WriteString(sql.QuoteIdent(req.Table))
 		sb.WriteString(" WHERE ")
 		i := 0
-		for k, v := range req.KeyData {
+		for k, v := range normalizedKeyData {
 			if i > 0 {
 				sb.WriteString(" AND ")
 			}
@@ -620,8 +679,14 @@ func handleInsert(conn net.Conn, session *Session, req Request) {
 	log.Printf("  row   = %v", req.Row)
 	log.Printf("  projection = %v", req.Projection)
 
+	normalizedRow, err := normalizeShadowMapValues(req.Row)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+
 	proj := projectionSet(req.Projection)
-	row := filterByProjection(req.Row, proj)
+	row := filterByProjection(normalizedRow, proj)
 
 	var cols []string
 	var vals []interface{}
@@ -668,10 +733,21 @@ func handleUpdate(conn net.Conn, session *Session, req Request) {
 	log.Printf("  where_row = %v", req.WhereRow)
 	log.Printf("  projection = %v", req.Projection)
 
+	normalizedSet, err := normalizeShadowMapValues(req.Set)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+	normalizedWhere, err := normalizeShadowMapValues(req.WhereRow)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
+
 	proj := projectionSet(req.Projection)
 
-	set := filterByProjection(req.Set, proj)
-	where := filterByProjection(req.WhereRow, proj)
+	set := filterByProjection(normalizedSet, proj)
+	where := filterByProjection(normalizedWhere, proj)
 
 	var sets []string
 	var args []any
@@ -731,8 +807,13 @@ func handleDelete(conn net.Conn, session *Session, req Request) {
 	}
 
 	// Projection 非空 ⇒ 只使用 projection ∩ row
+	normalizedRow, err := normalizeShadowMapValues(req.Row)
+	if err != nil {
+		sendError(conn, err.Error())
+		return
+	}
 	proj := projectionSet(req.Projection)
-	where := filterByProjection(req.Row, proj)
+	where := filterByProjection(normalizedRow, proj)
 
 	var cond []string
 	var args []any
