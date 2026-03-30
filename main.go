@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/go-mysql-org/go-mysql/mysql"
-	driverMysql "github.com/go-sql-driver/mysql"
 	"io"
 	"log"
 	"net"
@@ -15,6 +13,9 @@ import (
 	"proxy-go/sql"
 	"strconv"
 	"strings"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
+	driverMysql "github.com/go-sql-driver/mysql"
 )
 
 /* ======================================================
@@ -24,10 +25,10 @@ import (
 /* ---------- WHERE expr (only for OPEN) ---------- */
 
 type WhereExpr struct {
-	Type  string      `json:"type"`            // and / or / cmp / col / const
-	Op    string      `json:"op,omitempty"`    // = != < > <= >= LIKE
-	Name  string      `json:"name,omitempty"`  // column name
-	Value string      `json:"value,omitempty"` // literal
+	Type  string      `json:"type"`            // and / or / cmp / col / const / func / raw
+	Op    string      `json:"op,omitempty"`    // = != < > <= >= LIKE ...
+	Name  string      `json:"name,omitempty"`  // column name / function name
+	Value string      `json:"value,omitempty"` // literal / raw sql
 	Args  []WhereExpr `json:"args,omitempty"`
 	Left  *WhereExpr  `json:"left,omitempty"`
 	Right *WhereExpr  `json:"right,omitempty"`
@@ -491,12 +492,115 @@ func handleRaw(conn net.Conn, session *Session, req Request) {
 	//如果数据为空则返回字段名
 }
 
+//	func handleOpen(conn net.Conn, session *Session, req Request) {
+//		log.Println("[OPEN]")
+//		log.Printf("  table      = %s", req.Table)
+//		log.Printf("  projection = %v", req.Projection)
+//		log.Printf("  limit      = %d", req.Limit)
+//		log.Printf("  offset     = %d", req.Offset)
+//		var sb strings.Builder
+//		args := []any{}
+//
+//		// SELECT
+//		if req.Aggregate != nil {
+//			sb.WriteString("SELECT ")
+//			sb.WriteString(req.Aggregate.Type)
+//			sb.WriteString("(")
+//			sb.WriteString(req.Aggregate.Column)
+//			sb.WriteString(")")
+//		} else if len(req.Projection) > 0 {
+//			sb.WriteString("SELECT ")
+//			for i, c := range req.Projection {
+//				if i > 0 {
+//					sb.WriteString(",")
+//				}
+//				sb.WriteString(sql.QuoteIdent(c))
+//			}
+//		} else {
+//			sb.WriteString("SELECT *")
+//		}
+//
+//		sb.WriteString(" FROM ")
+//		sb.WriteString(sql.QuoteIdent(req.DBName))
+//		sb.WriteString(".")
+//		sb.WriteString(sql.QuoteIdent(req.Table))
+//
+//		// WHERE（直接信任 where_json）
+//		if req.Where != nil {
+//			sb.WriteString(" WHERE ")
+//			whereSQL := whereExprToSQL(req.Where)
+//			if whereSQL != "" {
+//				sb.WriteString(whereSQL)
+//			}
+//		}
+//
+//		// ORDER BY
+//		if len(req.OrderBy) > 0 {
+//			sb.WriteString(" ORDER BY ")
+//			for i, ob := range req.OrderBy {
+//				if i > 0 {
+//					sb.WriteString(",")
+//				}
+//				sb.WriteString(sql.QuoteIdent(ob.Col))
+//				if ob.Desc {
+//					sb.WriteString(" DESC")
+//				}
+//			}
+//		}
+//
+//		if req.Limit > 0 {
+//			sb.WriteString(" LIMIT ")
+//			sb.WriteString(strconv.FormatUint(req.Limit, 10))
+//		}
+//		if req.Offset > 0 {
+//			sb.WriteString(" OFFSET ")
+//			sb.WriteString(strconv.FormatUint(req.Offset, 10))
+//		}
+//		log.Println(sb.String())
+//		query, err := session.executor().Query(sb.String(), args...)
+//		if err != nil {
+//			sendDBError(conn, err)
+//			return
+//		}
+//		defer query.Close()
+//		cols, _ := query.Columns()
+//		colTypes, _ := query.ColumnTypes()
+//
+//		var seq uint8 = 0
+//
+//		// Column count
+//		_ = build.WritePacket(conn, &seq,
+//			mysql.PutLengthEncodedInt(uint64(len(cols))))
+//		build.WriteColumnNames(cols, conn, colTypes, &seq)
+//
+//		// Rows
+//		values := make([]interface{}, len(cols))
+//		ptrs := make([]interface{}, len(cols))
+//
+//		for i := range values {
+//			ptrs[i] = &values[i]
+//		}
+//		i := 0
+//		for query.Next() {
+//			query.Scan(ptrs...)
+//			row, err := build.MakeBinaryRow1(values, colTypes)
+//			if err != nil {
+//				log.Printf("[ERR] build OPEN row failed: %v", err)
+//				return
+//			}
+//			_ = build.WritePacket(conn, &seq, row)
+//			i = i + 1
+//		}
+//		build.WriteEOF(conn, &seq)
+//		//如果数据为空则返回字段名
+//	}
 func handleOpen(conn net.Conn, session *Session, req Request) {
 	log.Println("[OPEN]")
 	log.Printf("  table      = %s", req.Table)
 	log.Printf("  projection = %v", req.Projection)
 	log.Printf("  limit      = %d", req.Limit)
 	log.Printf("  offset     = %d", req.Offset)
+
 	var sb strings.Builder
 	args := []any{}
 
@@ -524,11 +628,11 @@ func handleOpen(conn net.Conn, session *Session, req Request) {
 	sb.WriteString(".")
 	sb.WriteString(sql.QuoteIdent(req.Table))
 
-	// WHERE（直接信任 where_json）
+	// WHERE
 	if req.Where != nil {
-		sb.WriteString(" WHERE ")
 		whereSQL := whereExprToSQL(req.Where)
 		if whereSQL != "" {
+			sb.WriteString(" WHERE ")
 			sb.WriteString(whereSQL)
 		}
 	}
@@ -555,31 +659,31 @@ func handleOpen(conn net.Conn, session *Session, req Request) {
 		sb.WriteString(" OFFSET ")
 		sb.WriteString(strconv.FormatUint(req.Offset, 10))
 	}
+
 	log.Println(sb.String())
+
 	query, err := session.executor().Query(sb.String(), args...)
 	if err != nil {
 		sendDBError(conn, err)
 		return
 	}
 	defer query.Close()
+
 	cols, _ := query.Columns()
 	colTypes, _ := query.ColumnTypes()
 
 	var seq uint8 = 0
 
-	// Column count
 	_ = build.WritePacket(conn, &seq,
 		mysql.PutLengthEncodedInt(uint64(len(cols))))
 	build.WriteColumnNames(cols, conn, colTypes, &seq)
 
-	// Rows
 	values := make([]interface{}, len(cols))
 	ptrs := make([]interface{}, len(cols))
-
 	for i := range values {
 		ptrs[i] = &values[i]
 	}
-	i := 0
+
 	for query.Next() {
 		query.Scan(ptrs...)
 		row, err := build.MakeBinaryRow1(values, colTypes)
@@ -588,10 +692,217 @@ func handleOpen(conn net.Conn, session *Session, req Request) {
 			return
 		}
 		_ = build.WritePacket(conn, &seq, row)
-		i = i + 1
 	}
+
 	build.WriteEOF(conn, &seq)
-	//如果数据为空则返回字段名
+}
+
+func quoteQualifiedIdent(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+
+	parts := strings.Split(name, ".")
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return ""
+		}
+		parts[i] = sql.QuoteIdent(part)
+	}
+	return strings.Join(parts, ".")
+}
+
+func normalizeCmpOp(op string) string {
+	switch strings.ToUpper(strings.TrimSpace(op)) {
+	case "=":
+		return "="
+	case "!=":
+		return "!="
+	case "<>":
+		return "<>"
+	case "<":
+		return "<"
+	case "<=":
+		return "<="
+	case ">":
+		return ">"
+	case ">=":
+		return ">="
+	case "LIKE":
+		return "LIKE"
+	case "NOT LIKE":
+		return "NOT LIKE"
+	case "REGEXP":
+		return "REGEXP"
+	case "NOT REGEXP":
+		return "NOT REGEXP"
+	case "RLIKE":
+		return "RLIKE"
+	default:
+		return ""
+	}
+}
+
+func scalarExprToSQL(e *WhereExpr) string {
+	if e == nil {
+		return ""
+	}
+
+	switch strings.ToLower(strings.TrimSpace(e.Type)) {
+	case "col":
+		return quoteQualifiedIdent(e.Name)
+
+	case "const":
+		return sqlLiteral(e.Value)
+
+	case "func":
+		funcName := strings.TrimSpace(e.Name)
+		if funcName == "" {
+			return ""
+		}
+
+		args := make([]string, 0, len(e.Args))
+		for i := range e.Args {
+			argSQL := scalarExprToSQL(&e.Args[i])
+			if argSQL == "" {
+				return ""
+			}
+			args = append(args, argSQL)
+		}
+
+		return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ", "))
+
+	case "raw":
+		return strings.TrimSpace(e.Value)
+
+	case "cmp":
+		sqlText := whereExprToSQL(e)
+		if sqlText == "" {
+			return ""
+		}
+		return "(" + sqlText + ")"
+
+	default:
+		return ""
+	}
+}
+
+func whereExprToSQL(e *WhereExpr) string {
+	if e == nil {
+		return ""
+	}
+
+	switch strings.ToLower(strings.TrimSpace(e.Type)) {
+	case "and":
+		parts := make([]string, 0, len(e.Args))
+		for i := range e.Args {
+			part := whereExprToSQL(&e.Args[i])
+			if part == "" {
+				return ""
+			}
+			parts = append(parts, part)
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		if len(parts) == 1 {
+			return parts[0]
+		}
+		return "(" + strings.Join(parts, " AND ") + ")"
+
+	case "or":
+		parts := make([]string, 0, len(e.Args))
+		for i := range e.Args {
+			part := whereExprToSQL(&e.Args[i])
+			if part == "" {
+				return ""
+			}
+			parts = append(parts, part)
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		if len(parts) == 1 {
+			return parts[0]
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+
+	case "cmp":
+		if e.Left == nil || e.Right == nil {
+			return ""
+		}
+
+		op := normalizeCmpOp(e.Op)
+		if op == "" {
+			return ""
+		}
+
+		leftSQL := scalarExprToSQL(e.Left)
+		rightSQL := scalarExprToSQL(e.Right)
+		if leftSQL == "" || rightSQL == "" {
+			return ""
+		}
+
+		return fmt.Sprintf("%s %s %s", leftSQL, op, rightSQL)
+
+	case "raw":
+		return strings.TrimSpace(e.Value)
+
+	default:
+		// 允许布尔函数表达式直接出现在 WHERE 中
+		return scalarExprToSQL(e)
+	}
+}
+
+func sqlLiteral(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+
+	case string:
+		if strings.EqualFold(x, "NULL") {
+			return "NULL"
+		}
+		escaped := strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(x)
+		return "'" + escaped + "'"
+
+	case int:
+		return fmt.Sprintf("%d", x)
+	case int8:
+		return fmt.Sprintf("%d", x)
+	case int16:
+		return fmt.Sprintf("%d", x)
+	case int32:
+		return fmt.Sprintf("%d", x)
+	case int64:
+		return fmt.Sprintf("%d", x)
+
+	case uint:
+		return fmt.Sprintf("%d", x)
+	case uint8:
+		return fmt.Sprintf("%d", x)
+	case uint16:
+		return fmt.Sprintf("%d", x)
+	case uint32:
+		return fmt.Sprintf("%d", x)
+	case uint64:
+		return fmt.Sprintf("%d", x)
+
+	case float32, float64:
+		return fmt.Sprintf("%v", x)
+
+	case bool:
+		if x {
+			return "TRUE"
+		}
+		return "FALSE"
+
+	default:
+		escaped := strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(fmt.Sprintf("%v", x))
+		return "'" + escaped + "'"
+	}
 }
 
 func writeFields(fields []*mysql.Field, seq *uint8, conn net.Conn) {
@@ -859,50 +1170,50 @@ func handleDelete(conn net.Conn, session *Session, req Request) {
 	build.WritePacket(conn, &seq, payload)
 }
 
-func whereExprToSQL(e *WhereExpr) string {
-	if e == nil {
-		return ""
-	}
+//func whereExprToSQL(e *WhereExpr) string {
+//	if e == nil {
+//		return ""
+//	}
+//
+//	switch e.Type {
+//	case "and":
+//		var parts []string
+//		for _, a := range e.Args {
+//			parts = append(parts, whereExprToSQL(&a))
+//		}
+//		return "(" + strings.Join(parts, " AND ") + ")"
+//
+//	case "or":
+//		var parts []string
+//		for _, a := range e.Args {
+//			parts = append(parts, whereExprToSQL(&a))
+//		}
+//		return "(" + strings.Join(parts, " OR ") + ")"
+//
+//	case "cmp":
+//		if e.Left == nil || e.Right == nil {
+//			return ""
+//		}
+//		col := e.Left.Name
+//		val := sqlLiteral(e.Right.Value)
+//		return fmt.Sprintf("%s %s %s", col, e.Op, val)
+//	}
+//
+//	return ""
+//}
 
-	switch e.Type {
-	case "and":
-		var parts []string
-		for _, a := range e.Args {
-			parts = append(parts, whereExprToSQL(&a))
-		}
-		return "(" + strings.Join(parts, " AND ") + ")"
-
-	case "or":
-		var parts []string
-		for _, a := range e.Args {
-			parts = append(parts, whereExprToSQL(&a))
-		}
-		return "(" + strings.Join(parts, " OR ") + ")"
-
-	case "cmp":
-		if e.Left == nil || e.Right == nil {
-			return ""
-		}
-		col := e.Left.Name
-		val := sqlLiteral(e.Right.Value)
-		return fmt.Sprintf("%s %s %s", col, e.Op, val)
-	}
-
-	return ""
-}
-
-func sqlLiteral(v interface{}) string {
-	switch x := v.(type) {
-	case nil:
-		return "NULL"
-	case string:
-		// 简化版，demo 用；生产要处理转义
-		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
-	case int, int32, int64:
-		return fmt.Sprintf("%d", x)
-	case float32, float64:
-		return fmt.Sprintf("%v", x)
-	default:
-		return "'" + fmt.Sprintf("%v", x) + "'"
-	}
-}
+//func sqlLiteral(v interface{}) string {
+//	switch x := v.(type) {
+//	case nil:
+//		return "NULL"
+//	case string:
+//		// 简化版，demo 用；生产要处理转义
+//		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+//	case int, int32, int64:
+//		return fmt.Sprintf("%d", x)
+//	case float32, float64:
+//		return fmt.Sprintf("%v", x)
+//	default:
+//		return "'" + fmt.Sprintf("%v", x) + "'"
+//	}
+//}
